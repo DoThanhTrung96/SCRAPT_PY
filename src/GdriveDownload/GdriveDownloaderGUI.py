@@ -31,8 +31,15 @@ from googleapiclient.errors import HttpError
 
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-# Root for token.json: change if you prefer a different location
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+# Determine project root for token.json and other assets
+if getattr(sys, 'frozen', False):
+    # Running as a bundled executable
+    project_root = os.path.dirname(sys.executable)
+else:
+    # Running as a normal script
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
 CLIENT_SECRETS_PATH_ENV = os.environ.get('CLIENT_SECRETS')
 TOKEN_PATH = os.path.join(project_root, 'token.json')
 
