@@ -1,0 +1,29 @@
+# Ignore everything by default
+*
+
+# But un-ignore directories to allow traversing them
+!*/
+
+# Un-ignore all Python script files
+!*.py
+
+# --- Specific Exclusions ---
+
+# Exclude the virtual environment folder
+/.venv/
+
+# Exclude all JSON files (like token.json and client_secrets.json)
+*.json
+
+# Exclude Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Exclude IDE/editor-specific folders
+.vscode/
+.idea/
+
+# Keep this .gitignore file in the repository
+!.gitignore
