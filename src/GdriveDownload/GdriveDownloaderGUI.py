@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-drive_downloader_robust_gui.py
+drive_downloader_robust_windows_safe.py
 
-Robust Google Drive folder downloader with resume (.part), retries, exponential backoff,
-per-file progress, and skip-if-complete (size/md5) logic. Uses interactive OAuth (token.json).
+Robust Google Drive folder downloader GUI with:
+- .part resume files and atomic rename
+- chunked downloads with retries and exponential backoff
+- skipping already-complete files via size/md5 when available
+- Windows-safe filename sanitization and long-path support
+- logs failed items to failed_downloads.txt
+
 Set CLIENT_SECRETS env var to point to your client_secrets.json.
 """
 
@@ -15,9 +20,11 @@ import threading
 import time
 import socket
 import hashlib
+import unicodedata
+import platform
+import traceback
 from pathlib import Path
 from datetime import datetime
-import traceback
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -31,29 +38,58 @@ from googleapiclient.errors import HttpError
 
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-
-# Determine project root for token.json and other assets
-if getattr(sys, 'frozen', False):
-    # Running as a bundled executable
-    project_root = os.path.dirname(sys.executable)
-else:
-    # Running as a normal script
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CLIENT_SECRETS_PATH_ENV = os.environ.get('CLIENT_SECRETS')
 TOKEN_PATH = os.path.join(project_root, 'token.json')
 
-# Download retry/backoff tunables
-CHUNK_SIZE = 8 * 1024 * 1024        # 8 MiB per chunk (tunable)
-MAX_CHUNK_RETRIES = 5               # per-chunk retries
-MAX_FILE_RETRIES = 5                # whole-file retries
-INITIAL_BACKOFF = 1.0               # seconds
+# Retry/backoff tunables
+CHUNK_SIZE = 8 * 1024 * 1024        # 8 MiB per chunk
+MAX_CHUNK_RETRIES = 5
+MAX_FILE_RETRIES = 5
+INITIAL_BACKOFF = 1.0
 BACKOFF_FACTOR = 2.0
 MAX_BACKOFF_SECONDS = 120.0
 
 # Behavior toggles
-FORCE_REEXPORT_NATIVE = False       # if True, re-export Google Docs/Sheets/Slides even if output exists
+FORCE_REEXPORT_NATIVE = False
 FAILED_ITEMS_PATH = "failed_downloads.txt"
+
+# --- Windows filename sanitization ---
+INVALID_WIN_CHARS = r'<>:"/\\|?*\x00-\x1f'
+INVALID_RE = re.compile(f'[{re.escape(INVALID_WIN_CHARS)}]')
+
+def sanitize_name(name: str, max_len=240) -> str:
+    if not name:
+        return 'unnamed'
+    # Normalize Unicode
+    name = unicodedata.normalize('NFKC', name)
+    # Replace invalid chars
+    name = INVALID_RE.sub('_', name)
+    # Remove trailing dots/spaces
+    name = name.rstrip(' .')
+    # Collapse whitespace
+    name = re.sub(r'\s+', ' ', name)
+    # Trim length
+    if len(name) > max_len:
+        name = name[:max_len]
+    return name or 'unnamed'
+
+def ensure_parent_dir(path: Path):
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+
+def windows_longpath(path: Path) -> str:
+    p = str(path)
+    if platform.system() == 'Windows':
+        abs_p = os.path.abspath(p)
+        if abs_p.startswith('\\\\?\\'):
+            return abs_p
+        # Apply prefix if long or to avoid OS path issues
+        if len(abs_p) > 250:
+            return '\\\\?\\' + abs_p
+        return abs_p
+    return p
 
 # --- Utilities ---
 def _safe_sleep_backoff(attempt, http_status=None):
@@ -65,7 +101,7 @@ def _safe_sleep_backoff(attempt, http_status=None):
 
 def md5_of_file(path: Path, chunk=8192):
     h = hashlib.md5()
-    with open(path, 'rb') as f:
+    with open(windows_longpath(path), 'rb') as f:
         while True:
             data = f.read(chunk)
             if not data:
@@ -73,7 +109,7 @@ def md5_of_file(path: Path, chunk=8192):
             h.update(data)
     return h.hexdigest()
 
-# --- Auth ---
+# --- Authentication (interactive by default) ---
 def get_credentials():
     creds = None
     if not CLIENT_SECRETS_PATH_ENV or not os.path.exists(CLIENT_SECRETS_PATH_ENV):
@@ -96,11 +132,14 @@ def extract_file_id(drive_url_or_id: str) -> str:
     if re.match(r'^[a-zA-Z0-9_-]{10,}$', s):
         return s
     m = re.search(r'/folders/([a-zA-Z0-9_-]+)', s)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r'/d/([a-zA-Z0-9_-]+)', s)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r'id=([a-zA-Z0-9_-]+)', s)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     raise ValueError("Could not extract file or folder id from input")
 
 def list_folder_children(service, folder_id):
@@ -119,7 +158,7 @@ def get_file_metadata(service, file_id):
     fields = 'id,name,mimeType,size,md5Checksum'
     return service.files().get(fileId=file_id, fields=fields).execute()
 
-# --- Skip / resume checks ---
+# --- Skip logic ---
 def should_skip_binary_file(local_path: Path, drive_size, drive_md5, log_callback):
     if not local_path.exists():
         return False
@@ -146,29 +185,30 @@ def should_skip_binary_file(local_path: Path, drive_size, drive_md5, log_callbac
             log_callback(f"Could not compute md5 for {local_path.name}: {e}")
     return False
 
-# --- Robust download functions ---
+# --- Robust download functions (Windows-safe) ---
 def download_file_to_path_with_retries(service, file_meta, out_path: Path, log_callback, progress_percent_callback):
-    """
-    file_meta: dict from get_file_metadata/list folder listing
-    out_path: final Path
-    """
     file_id = file_meta['id']
-    filename = file_meta.get('name') or file_id
+    raw_name = file_meta.get('name') or file_id
+    safe_name = sanitize_name(raw_name)
+    out_path = out_path.parent / safe_name
     drive_size = file_meta.get('size')
     drive_md5 = file_meta.get('md5Checksum')
 
-    # Skip if final file matches Drive (size or md5)
     if should_skip_binary_file(out_path, drive_size, drive_md5, log_callback):
         progress_percent_callback(100)
         return str(out_path)
 
+    # ensure parent exists
+    ensure_parent_dir(out_path)
+
     temp_path = out_path.with_suffix(out_path.suffix + ".part") if out_path.suffix else Path(str(out_path) + ".part")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_parent_dir(temp_path)
 
     for file_attempt in range(1, MAX_FILE_RETRIES + 1):
         try:
             mode = "r+b" if temp_path.exists() else "wb"
-            with open(temp_path, mode) as fh:
+            open_path = windows_longpath(temp_path)
+            with open(open_path, mode) as fh:
                 if mode == "r+b":
                     fh.seek(0, os.SEEK_END)
                 request = service.files().get_media(fileId=file_id)
@@ -184,7 +224,7 @@ def download_file_to_path_with_retries(service, file_meta, out_path: Path, log_c
                             pct = int(status.progress() * 100)
                             if pct != last_pct:
                                 last_pct = pct
-                                log_callback(f"Downloading {filename}: {pct}%")
+                                log_callback(f"Downloading {safe_name}: {pct}%")
                                 progress_percent_callback(pct)
                     except HttpError as exc:
                         status_code = None
@@ -193,17 +233,16 @@ def download_file_to_path_with_retries(service, file_meta, out_path: Path, log_c
                         except Exception:
                             pass
                         chunk_attempt += 1
-                        log_callback(f"HttpError chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {filename}: status={status_code} error={exc}")
+                        log_callback(f"HttpError chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {safe_name}: status={status_code} error={exc}")
                         if chunk_attempt > MAX_CHUNK_RETRIES:
                             raise
                         _safe_sleep_backoff(chunk_attempt, http_status=status_code)
-                        # recreate downloader to resume from file pointer
                         request = service.files().get_media(fileId=file_id)
                         downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                         continue
                     except (socket.timeout, socket.error, OSError) as exc:
                         chunk_attempt += 1
-                        log_callback(f"Network error chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {filename}: {exc}")
+                        log_callback(f"Network error chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {safe_name}: {exc}")
                         if chunk_attempt > MAX_CHUNK_RETRIES:
                             raise
                         _safe_sleep_backoff(chunk_attempt)
@@ -211,11 +250,13 @@ def download_file_to_path_with_retries(service, file_meta, out_path: Path, log_c
                         downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                         continue
 
-            # finished, move temp to final
-            temp_path.replace(out_path)
+            # finalize: atomic replace using longpath when needed
+            try:
+                os.replace(windows_longpath(temp_path), windows_longpath(out_path))
+            except Exception:
+                temp_path.replace(out_path)
             log_callback(f"Saved: {out_path}")
             progress_percent_callback(100)
-            # optional integrity check
             if drive_md5:
                 try:
                     local_md5 = md5_of_file(out_path)
@@ -226,31 +267,33 @@ def download_file_to_path_with_retries(service, file_meta, out_path: Path, log_c
             return str(out_path)
 
         except Exception as e:
-            log_callback(f"Failed attempt {file_attempt}/{MAX_FILE_RETRIES} for {filename}: {e}")
+            log_callback(f"Failed attempt {file_attempt}/{MAX_FILE_RETRIES} for {safe_name}: {e}")
             if file_attempt >= MAX_FILE_RETRIES:
                 raise
             _safe_sleep_backoff(file_attempt)
 
 def export_google_workspace_file_with_retries(service, file_meta, mime_type, out_path: Path, log_callback, progress_percent_callback):
-    file_id = file_meta['id']
-    filename = file_meta.get('name') or file_id
-
-    # Skip if exists and not forced
-    if out_path.exists() and not FORCE_REEXPORT_NATIVE:
-        log_callback(f"Skipping export {out_path.name} (already exists)")
+    raw_name = file_meta.get('name') or file_meta['id']
+    safe_name = sanitize_name(raw_name)
+    # Keep extension from out_path argument
+    final_out = out_path.parent / (safe_name + out_path.suffix)
+    if final_out.exists() and not FORCE_REEXPORT_NATIVE:
+        log_callback(f"Skipping export {final_out.name} (already exists)")
         progress_percent_callback(100)
-        return str(out_path)
+        return str(final_out)
 
-    temp_path = out_path.with_suffix(out_path.suffix + ".part") if out_path.suffix else Path(str(out_path) + ".part")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_parent_dir(final_out)
+    temp_path = final_out.with_suffix(final_out.suffix + ".part") if final_out.suffix else Path(str(final_out) + ".part")
+    ensure_parent_dir(temp_path)
 
     for file_attempt in range(1, MAX_FILE_RETRIES + 1):
         try:
+            open_path = windows_longpath(temp_path)
             mode = "r+b" if temp_path.exists() else "wb"
-            with open(temp_path, mode) as fh:
+            with open(open_path, mode) as fh:
                 if mode == "r+b":
                     fh.seek(0, os.SEEK_END)
-                request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+                request = service.files().export_media(fileId=file_meta['id'], mimeType=mime_type)
                 downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                 done = False
                 chunk_attempt = 0
@@ -263,7 +306,7 @@ def export_google_workspace_file_with_retries(service, file_meta, mime_type, out
                             pct = int(status.progress() * 100)
                             if pct != last_pct:
                                 last_pct = pct
-                                log_callback(f"Exporting {out_path.name}: {pct}%")
+                                log_callback(f"Exporting {final_out.name}: {pct}%")
                                 progress_percent_callback(pct)
                     except HttpError as exc:
                         status_code = None
@@ -272,38 +315,41 @@ def export_google_workspace_file_with_retries(service, file_meta, mime_type, out
                         except Exception:
                             pass
                         chunk_attempt += 1
-                        log_callback(f"HttpError export chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {out_path.name}: status={status_code} error={exc}")
+                        log_callback(f"HttpError export chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {final_out.name}: status={status_code} error={exc}")
                         if chunk_attempt > MAX_CHUNK_RETRIES:
                             raise
                         _safe_sleep_backoff(chunk_attempt, http_status=status_code)
-                        request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+                        request = service.files().export_media(fileId=file_meta['id'], mimeType=mime_type)
                         downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                         continue
                     except (socket.timeout, socket.error, OSError) as exc:
                         chunk_attempt += 1
-                        log_callback(f"Network error export chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {out_path.name}: {exc}")
+                        log_callback(f"Network error export chunk ({chunk_attempt}/{MAX_CHUNK_RETRIES}) for {final_out.name}: {exc}")
                         if chunk_attempt > MAX_CHUNK_RETRIES:
                             raise
                         _safe_sleep_backoff(chunk_attempt)
-                        request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+                        request = service.files().export_media(fileId=file_meta['id'], mimeType=mime_type)
                         downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                         continue
 
-            temp_path.replace(out_path)
-            log_callback(f"Exported: {out_path}")
+            try:
+                os.replace(windows_longpath(temp_path), windows_longpath(final_out))
+            except Exception:
+                temp_path.replace(final_out)
+            log_callback(f"Exported: {final_out}")
             progress_percent_callback(100)
-            return str(out_path)
+            return str(final_out)
 
         except Exception as e:
-            log_callback(f"Failed export attempt {file_attempt}/{MAX_FILE_RETRIES} for {out_path.name}: {e}")
+            log_callback(f"Failed export attempt {file_attempt}/{MAX_FILE_RETRIES} for {final_out.name}: {e}")
             if file_attempt >= MAX_FILE_RETRIES:
                 raise
             _safe_sleep_backoff(file_attempt)
 
-# --- Recursive folder download with failure logging ---
+# --- Recursive download with failure logging ---
 def download_folder_recursive(service, folder_id, target_dir, log_callback, progress_percent_callback, failed_items):
     meta = service.files().get(fileId=folder_id, fields='id,name,mimeType').execute()
-    folder_name = meta.get('name') or folder_id
+    folder_name = sanitize_name(meta.get('name') or folder_id)
     base_path = Path(target_dir) / folder_name
     log_callback(f"Starting folder: {folder_name}")
     _download_folder_contents(service, folder_id, base_path, log_callback, progress_percent_callback, failed_items)
@@ -312,45 +358,44 @@ def _download_folder_contents(service, folder_id, current_path: Path, log_callba
     current_path.mkdir(parents=True, exist_ok=True)
     for item in list_folder_children(service, folder_id):
         item_id = item['id']
-        name = item['name']
+        name = item.get('name') or item_id
         mime = item.get('mimeType', '')
         try:
             meta = get_file_metadata(service, item_id)
             if meta.get('mimeType') == 'application/vnd.google-apps.folder':
-                log_callback(f"Entering folder: {name}")
-                _download_folder_contents(service, item_id, current_path / name, log_callback, progress_percent_callback, failed_items)
+                log_callback(f"Entering folder: {sanitize_name(name)}")
+                _download_folder_contents(service, item_id, current_path / sanitize_name(name), log_callback, progress_percent_callback, failed_items)
             else:
                 if meta.get('mimeType') == 'application/vnd.google-apps.document':
-                    out_file = current_path / f"{name}.pdf"
+                    out_file = current_path / f"{sanitize_name(name)}.pdf"
                     log_callback(f"Exporting Google Doc: {name}")
                     export_google_workspace_file_with_retries(service, meta, 'application/pdf', out_file, log_callback, progress_percent_callback)
                 elif meta.get('mimeType') == 'application/vnd.google-apps.spreadsheet':
-                    out_file = current_path / f"{name}.xlsx"
+                    out_file = current_path / f"{sanitize_name(name)}.xlsx"
                     log_callback(f"Exporting Google Sheet: {name}")
                     export_google_workspace_file_with_retries(service, meta, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', out_file, log_callback, progress_percent_callback)
                 elif meta.get('mimeType') == 'application/vnd.google-apps.presentation':
-                    out_file = current_path / f"{name}.pdf"
+                    out_file = current_path / f"{sanitize_name(name)}.pdf"
                     log_callback(f"Exporting Google Slide: {name}")
                     export_google_workspace_file_with_retries(service, meta, 'application/pdf', out_file, log_callback, progress_percent_callback)
                 else:
-                    out_file = current_path / name
+                    out_file = current_path / sanitize_name(name)
                     log_callback(f"Downloading file: {name}")
                     download_file_to_path_with_retries(service, meta, out_file, log_callback, progress_percent_callback)
-                # small pause between files to reduce throttling
                 time.sleep(0.2)
         except Exception as e:
             log_callback(f"ERROR downloading {name}: {e}")
             failed_items.append({'id': item_id, 'name': name, 'error': str(e)})
-            # continue with other files
+            continue
 
 # --- GUI ---
 class GdriveDownloaderApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Google Drive Downloader — robust resume & backoff")
-        self.geometry("900x600")
+        self.title("Google Drive Downloader — robust & Windows-safe")
+        self.geometry("920x640")
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure((0,1,2,3,4,5), weight=1)
+        self.grid_rowconfigure((0,1,2,3,4,5,6), weight=1)
 
         self.url_label = ctk.CTkLabel(self, text="Google Drive Folder URL or ID:")
         self.url_label.grid(row=0, column=0, padx=10, pady=6, sticky="w")
@@ -367,21 +412,19 @@ class GdriveDownloaderApp(ctk.CTk):
         self.download_button = ctk.CTkButton(self, text="Download Folder", command=self.start_download_thread)
         self.download_button.grid(row=2, column=0, columnspan=3, padx=10, pady=8, sticky="ew")
 
-        # options
-        self.force_export_var = ctk.StringVar(value=str(FORCE_REEXPORT_NATIVE))
         self.force_export_check = ctk.CTkCheckBox(self, text="Force re-export native Google files (Docs/Sheets/Slides)", command=self.toggle_force_export)
         self.force_export_check.grid(row=3, column=0, columnspan=3, padx=12, pady=4, sticky="w")
         if FORCE_REEXPORT_NATIVE:
             self.force_export_check.select()
 
-        self.status_label = ctk.CTkLabel(self, text="", wraplength=860, anchor="w", justify="left")
+        self.status_label = ctk.CTkLabel(self, text="", wraplength=880, anchor="w", justify="left")
         self.status_label.grid(row=4, column=0, columnspan=3, padx=12, pady=6, sticky="nsew")
 
-        self.progress = ctk.CTkProgressBar(self, width=860)
+        self.progress = ctk.CTkProgressBar(self, width=880)
         self.progress.grid(row=5, column=0, columnspan=3, padx=12, pady=6, sticky="ew")
         self.progress.set(0.0)
 
-        self.log_box = ctk.CTkTextbox(self, width=880, height=300)
+        self.log_box = ctk.CTkTextbox(self, width=900, height=340)
         self.log_box.grid(row=6, column=0, columnspan=3, padx=12, pady=8, sticky="nsew")
         self.log_box.configure(state="disabled")
 
@@ -447,7 +490,6 @@ class GdriveDownloaderApp(ctk.CTk):
             self.append_log(f"An unexpected error occurred: {e}\n{tb}", "red")
             messagebox.showerror("Error", f"An unexpected error occurred: {e}")
         finally:
-            # Write failed items log if any
             if failed_items:
                 try:
                     with open(FAILED_ITEMS_PATH, 'w', encoding='utf-8') as f:
