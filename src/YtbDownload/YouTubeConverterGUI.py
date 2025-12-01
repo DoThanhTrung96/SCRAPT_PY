@@ -1,56 +1,76 @@
 import os
+import re
+import glob
+import threading
 import yt_dlp
 from pydub import AudioSegment
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-
-def download_video(url, output_path='.'):
-    ydl_opts = {
-        'outtmpl': f'{output_path}/%(title)s.%(ext)s',
-        'noplaylist': True,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-        # yt-dlp returns the full path of the downloaded file
-        # We need to find the actual filename from the info_dict
-        # This can be tricky as it might be a merged file
-        # For simplicity, let's assume it's in the output_path with a common naming convention
-        # A more robust solution would involve parsing the output of ydl.download
-        # For now, let's return a placeholder or try to infer the name
-        # A better approach is to use the 'filepath' from the info_dict if available
-        if 'filepath' in info_dict:
-            return info_dict['filepath']
-        else:
-            # Fallback if 'filepath' is not directly available
-            # This might not be accurate for all cases, especially merged formats
-            return os.path.join(output_path, f"{info_dict.get('title', 'downloaded_video')}.mp4")
-
 import subprocess
 
-def download_video(url, output_path='.'):
+class ProgressHook:
+    """yt-dlp progress hook to update GUI in real-time"""
+    def __init__(self, update_callback):
+        self.update_callback = update_callback
+    
+    def __call__(self, d):
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', 'N/A').strip()
+            speed = d.get('_speed_str', 'N/A').strip()
+            eta = d.get('_eta_str', 'N/A').strip()
+            msg = f"Downloading: {percent} | Speed: {speed} | ETA: {eta}"
+            self.update_callback(msg, "yellow")
+        elif d['status'] == 'finished':
+            self.update_callback("Download finished, processing...", "yellow")
+
+def download_video(url, output_path='.', progress_callback=None):
+    """Download video with real-time progress updates - optimized to avoid filename issues"""
+    
+    # Strategy: Use windowsfilenames=True to automatically sanitize filenames for Windows
+    # Force H.264 codec for maximum compatibility (AV1 not supported by many players)
     ydl_opts = {
         'outtmpl': f'{output_path}/%(title)s.%(ext)s',
         'noplaylist': True,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'quiet': False,
+        'no_warnings': False,
+        'windowsfilenames': True,  # Sanitize filenames for Windows compatibility
+        'merge_output_format': 'mp4',  # Ensure merged output is mp4
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-        if 'filepath' in info_dict:
-            return info_dict['filepath']
-        else:
-            return os.path.join(output_path, f"{info_dict.get('title', 'downloaded_video')}.mp4")
+    
+    if progress_callback:
+        ydl_opts['progress_hooks'] = [ProgressHook(progress_callback)]
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(url, download=True)
+            
+            # Get the sanitized title that was actually used
+            title = ydl.prepare_filename(info_dict)
+            
+            # Check if file exists
+            if os.path.exists(title):
+                return title
+            
+            # Fallback: find the most recently created mp4 file
+            mp4_files = glob.glob(os.path.join(output_path, "*.mp4"))
+            if mp4_files:
+                return max(mp4_files, key=os.path.getmtime)
+            
+            return None
+    except Exception as e:
+        raise Exception(f"Download failed: {str(e)}")
 
 class YouTubeConverterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("YouTube Downloader & Converter")
-        self.geometry("700x400")
+        self.geometry("800x500")
 
         # Configure grid layout
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure((0, 1, 2, 3, 4), weight=1)
+        self.grid_rowconfigure((0, 1, 2, 3, 4, 5), weight=1)
 
         # URL Input
         self.url_label = ctk.CTkLabel(self, text="YouTube URL:")
@@ -74,11 +94,20 @@ class YouTubeConverterApp(ctk.CTk):
         self.convert_button = ctk.CTkButton(self, text="Convert Last Downloaded to MP3", command=self.start_conversion)
         self.convert_button.grid(row=3, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
 
+        # Progress Bar
+        self.progress_label = ctk.CTkLabel(self, text="Progress:", text_color="gray")
+        self.progress_label.grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        self.progress_bar = ctk.CTkProgressBar(self, mode='determinate')
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=4, column=1, columnspan=2, padx=10, pady=5, sticky="ew")
+
         # Status Label
-        self.status_label = ctk.CTkLabel(self, text="", wraplength=600)
-        self.status_label.grid(row=4, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
+        self.status_label = ctk.CTkLabel(self, text="Ready", wraplength=700, justify="left")
+        self.status_label.grid(row=5, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
 
         self.last_downloaded_file = None
+        self.is_downloading = False
+        self.is_converting = False
 
     def browse_output_path(self):
         folder_selected = filedialog.askdirectory()
@@ -88,71 +117,111 @@ class YouTubeConverterApp(ctk.CTk):
 
     def update_status(self, message, color="white"):
         self.status_label.configure(text=message, text_color=color)
+        self.update()  # Force GUI refresh
 
     def start_download(self):
         url = self.url_entry.get()
         output_dir = self.output_path_entry.get()
 
         if not url:
-            self.update_status("Please enter a YouTube URL.", "red")
+            self.update_status("❌ Please enter a YouTube URL.", "red")
             return
         if not output_dir:
-            self.update_status("Please select an output directory.", "red")
+            self.update_status("❌ Please select an output directory.", "red")
             return
 
-        self.update_status("Downloading video... This may take a while.", "yellow")
+        if self.is_downloading or self.is_converting:
+            self.update_status("⚠️ Operation already in progress. Please wait.", "orange")
+            return
+
+        self.is_downloading = True
         self.download_button.configure(state="disabled")
         self.convert_button.configure(state="disabled")
+        self.progress_bar.set(0)
 
+        # Run download in a separate thread
+        thread = threading.Thread(target=self._download_worker, args=(url, output_dir), daemon=True)
+        thread.start()
+
+    def _download_worker(self, url, output_dir):
+        """Worker thread for downloading"""
         try:
-            downloaded_filepath = download_video(url, output_dir)
-            if downloaded_filepath:
+            self.update_status("📥 Downloading video... This may take a while.", "yellow")
+            downloaded_filepath = download_video(url, output_dir, progress_callback=self.update_status)
+            
+            if downloaded_filepath and os.path.exists(downloaded_filepath):
                 self.last_downloaded_file = downloaded_filepath
-                self.update_status(f"Download complete: {os.path.basename(downloaded_filepath)}", "green")
+                file_size = os.path.getsize(downloaded_filepath) / (1024 * 1024)  # MB
+                self.progress_bar.set(1.0)
+                self.update_status(f"✅ Download complete: {os.path.basename(downloaded_filepath)} ({file_size:.1f} MB)", "green")
             else:
-                self.update_status("Download failed or file path could not be determined.", "red")
+                self.update_status("❌ Download failed or file path could not be determined.", "red")
+                self.progress_bar.set(0)
         except Exception as e:
-            self.update_status(f"Download error: {e}", "red")
+            self.update_status(f"❌ Download error: {str(e)}", "red")
+            self.progress_bar.set(0)
         finally:
+            self.is_downloading = False
             self.download_button.configure(state="normal")
             self.convert_button.configure(state="normal")
 
     def start_conversion(self):
         if not self.last_downloaded_file:
-            self.update_status("No video downloaded yet to convert.", "red")
+            self.update_status("❌ No video downloaded yet to convert.", "red")
             return
 
         output_dir = self.output_path_entry.get()
         if not output_dir:
-            self.update_status("Please select an output directory for MP3.", "red")
+            self.update_status("❌ Please select an output directory for MP3.", "red")
             return
 
-        self.update_status("Converting to MP3...", "yellow")
+        if self.is_downloading or self.is_converting:
+            self.update_status("⚠️ Operation already in progress. Please wait.", "orange")
+            return
+
+        self.is_converting = True
         self.download_button.configure(state="disabled")
         self.convert_button.configure(state="disabled")
+        self.progress_bar.set(0)
 
+        # Run conversion in a separate thread
+        thread = threading.Thread(target=self._conversion_worker, args=(output_dir,), daemon=True)
+        thread.start()
+
+    def _conversion_worker(self, output_dir):
+        """Worker thread for converting to MP3"""
         try:
-            # Go up two levels to find the project root from the current script location
+            self.update_status("🎵 Converting to MP3... This may take a few moments.", "yellow")
+            
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
             python_executable = os.path.join(project_root, ".venv", "Scripts", "python.exe")
             video_converter_script = os.path.join(project_root, "src", "YtbDownload", "VideoConverter.py")
             
-            # Ensure the python executable exists
             if not os.path.exists(python_executable):
-                # Fallback to the system's python if not found in .venv
                 python_executable = "python"
 
-            result = subprocess.run([python_executable, video_converter_script, self.last_downloaded_file, output_dir], capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                [python_executable, video_converter_script, self.last_downloaded_file, output_dir],
+                capture_output=True,
+                text=True,
+                check=False
+            )
             
             if result.returncode == 0:
-                self.update_status(f"Conversion complete: {os.path.basename(self.last_downloaded_file).replace('.mp4', '.mp3')}", "green")
+                mp3_name = os.path.basename(self.last_downloaded_file).replace('.mp4', '.mp3')
+                mp3_path = os.path.join(output_dir, mp3_name)
+                mp3_size = os.path.getsize(mp3_path) / (1024 * 1024) if os.path.exists(mp3_path) else 0
+                self.progress_bar.set(1.0)
+                self.update_status(f"✅ Conversion complete: {mp3_name} ({mp3_size:.1f} MB)", "green")
             else:
-                self.update_status(f"Conversion error: {result.stderr}", "red")
-        except subprocess.CalledProcessError as e:
-            self.update_status(f"Conversion failed: {e.stderr}", "red")
+                error_msg = result.stderr if result.stderr else "Unknown error"
+                self.update_status(f"❌ Conversion error: {error_msg}", "red")
+                self.progress_bar.set(0)
         except Exception as e:
-            self.update_status(f"An unexpected error occurred: {e}", "red")
+            self.update_status(f"❌ Conversion failed: {str(e)}", "red")
+            self.progress_bar.set(0)
         finally:
+            self.is_converting = False
             self.download_button.configure(state="normal")
             self.convert_button.configure(state="normal")
 
